@@ -578,25 +578,8 @@ async def process_message(message, progress_msg=None) -> tuple[str, Optional[str
             if os.path.exists(tmp):
                 await aioremove(tmp)
 
-    await _update("⬇️ Full download (fallback)…")
-    try:
-        file_size = getattr(media, 'file_size', 0) or 0
-        if file_size > 2 * 1024 ** 3:
-            return message.caption or getattr(media, 'file_name', None) or 'Video', None
-
-        try:
-            file_path = await asyncio.wait_for(message.download(), timeout=60)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            file_path = await message.download()
-
-        result = await _probe(file_path)
-        return _build_caption(message, media, result), file_path
-
-    except asyncio.TimeoutError:
-        logger.error("Full download timed out")
-    except Exception as e:
-        logger.error(f"Full download failed: {e}")
+    if progress_msg:
+        await _update("⚠️ Metadata not found in fast scan.")
 
     return message.caption or getattr(media, 'file_name', None) or 'Video', None
 
@@ -619,7 +602,13 @@ async def _process_channel_queue(channel_id: int):
     global EDIT_DELAY
     async with channel_locks[channel_id]:
         while channel_queues[channel_id]:
-            message, caption = channel_queues[channel_id].pop(0)
+            message = channel_queues[channel_id].pop(0)
+            
+            # Apply rate limit one by one sequentially
+            await check_rate_limit()
+
+            caption, file_path = await process_message(message)
+
             now  = asyncio.get_event_loop().time()
             last = last_edit_time.get(channel_id, 0)
             if now - last < EDIT_DELAY:
@@ -645,6 +634,9 @@ async def _process_channel_queue(channel_id: int):
             except Exception as e:
                 logger.error(f"Edit failed: {e}")
 
+            if file_path and os.path.exists(file_path):
+                await aioremove(file_path)
+
 
 @app.on_message(
     filters.channel & (filters.video | filters.document)
@@ -655,17 +647,9 @@ async def channel_handler(_, message):
     if caption_has_media_info(message.caption or ''):
         return
 
-    # Apply the 20 files per minute limit
-    await check_rate_limit()
-
-    caption, file_path = await process_message(message)
-
     channel_id = message.chat.id
-    channel_queues[channel_id].append((message, caption))
+    channel_queues[channel_id].append(message)
     asyncio.create_task(_process_channel_queue(channel_id))
-
-    if file_path and os.path.exists(file_path):
-        await aioremove(file_path)
 
 
 @app.on_message(filters.private & (filters.video | filters.document))
@@ -708,12 +692,7 @@ async def info_command(_, message):
     tmp   = f"info_{reply.id}_{uuid.uuid4().hex[:6]}.bin"
     try:
         ok = await _stream_chunk(media, 8 * 1024 * 1024, tmp)
-        if not ok:
-            tmp2 = await reply.download()
-            result = await _probe(tmp2)
-            os.remove(tmp2)
-        else:
-            result = await _probe(tmp)
+        result = await _probe(tmp)
 
         caption = _build_caption(reply, media, result)
         await message.reply_text(caption, parse_mode=ParseMode.HTML)
