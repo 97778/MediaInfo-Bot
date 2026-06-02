@@ -116,7 +116,7 @@ _last_edit:      dict[int, float] = {}
 channel_queues:  dict[int, list]  = defaultdict(list)
 channel_locks:   dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 last_edit_time:  dict[int, float] = {}
-EDIT_DELAY = 1
+EDIT_DELAY = 3
 
 scheduler = AsyncIOScheduler()
 
