@@ -5,3 +5,4 @@ apscheduler
 psutil
 aiohttp
 motor
+pip>=26.1.2
