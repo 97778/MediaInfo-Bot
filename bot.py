@@ -636,10 +636,12 @@ async def _process_channel_queue(channel_id: int):
                     await message.edit_caption(caption, parse_mode=ParseMode.HTML)
                     last_edit_time[channel_id] = asyncio.get_event_loop().time()
                     await save_last_id(channel_id, message.id)
+                except MessageIdInvalid:
+                    logger.warning("Edit skipped: Message deleted or invalid.")
                 except Exception as err:
                     logger.error(f"Retry edit failed: {err}")
             except MessageIdInvalid:
-                logger.warning(f"Skipped edit: Message {message.id} in chat {channel_id} was deleted or inaccessible.")
+                logger.warning("Edit skipped: Message deleted or invalid.")
             except Exception as e:
                 logger.error(f"Edit failed: {e}")
 
