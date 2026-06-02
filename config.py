@@ -35,7 +35,7 @@ GC_THRESHOLD = (
 CAPTION_TEMPLATE = os.environ.get(
     "CAPTION_TEMPLATE",
     "<b>{title}</b>\n\n"
-    "🎬 <b>{video_line}</b>" | ⏳ <b>{duration}</b>\n"
+    "🎬 <b>{video_line}</b> | ⏳ <b>{duration}</b>\n"
     # " | ⏳ <b>{duration}</b>\n"
     # "🔊 <b>{audio}</b>\n"
     # "💬 <b>{subtitle}</b>\n\n"
