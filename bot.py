@@ -40,34 +40,9 @@ last_id_collection = db["last_processed_id"]
 settings_collection = db["settings"] # For Dynamic Allowed Chats
 
 # --- RATE LIMITER CONFIG ---
-FILES_PER_MINUTE = 20
-rate_limit_lock = asyncio.Lock()
-processed_count = 0
-last_reset_time = time.time()
-
+# Rate limiter disabled as requested. We now rely strictly on EDIT_DELAY.
 async def check_rate_limit():
-    """Ensures no more than 20 files are processed per 60 seconds."""
-    global processed_count, last_reset_time
-    async with rate_limit_lock:
-        current_time = time.time()
-        # Reset counter every 60 seconds
-        if current_time - last_reset_time >= 60:
-            processed_count = 0
-            last_reset_time = current_time
-        
-        if processed_count >= FILES_PER_MINUTE:
-            wait_time = 60 - (current_time - last_reset_time)
-            if wait_time > 0:
-                logger.info(f"Rate limit reached ({FILES_PER_MINUTE}/min). Waiting {int(wait_time)}s...")
-                await asyncio.sleep(wait_time)
-                # Reset after sleeping
-                processed_count = 0
-                last_reset_time = time.time()
-        
-        processed_count += 1
-        remaining = FILES_PER_MINUTE - processed_count
-        if processed_count % 5 == 0 or remaining < 3:
-            logger.info(f"Rate Limit: {processed_count}/{FILES_PER_MINUTE} processed. Quota remaining: {remaining}")
+    pass
 
 # --- DYNAMIC CHAT MANAGEMENT ---
 authorized_chats = set(ALLOWED_CHATS)
@@ -116,7 +91,7 @@ _last_edit:      dict[int, float] = {}
 channel_queues:  dict[int, list]  = defaultdict(list)
 channel_locks:   dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 last_edit_time:  dict[int, float] = {}
-EDIT_DELAY = 3
+EDIT_DELAY = 3.5
 
 scheduler = AsyncIOScheduler()
 
@@ -604,7 +579,7 @@ async def _process_channel_queue(channel_id: int):
         while channel_queues[channel_id]:
             message = channel_queues[channel_id].pop(0)
             
-            # Apply rate limit one by one sequentially
+            # Rate limit is now disabled, it just passes instantly
             await check_rate_limit()
 
             caption, file_path = await process_message(message)
