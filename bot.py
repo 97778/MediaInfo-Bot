@@ -797,7 +797,7 @@ async def start_health_server():
     port = int(os.environ.get("PORT", 8080)) 
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Koyeb Health Check server active on port {port}")
+    logger.info(f"Health Check server active on port {port}")
 
 
 async def main():
