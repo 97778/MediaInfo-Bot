@@ -24,19 +24,10 @@ GC_THRESHOLD = (
     int(os.environ.get("GC_THRESHOLD_2", 5)),
 )
 
-#CAPTION_TEMPLATE = os.environ.get(
- #   "CAPTION_TEMPLATE",
-  #  "<b>{title}</b>\n\n"
-  #  "🎬 <b>{video_line}</b> | ⏳ <b>{duration}</b>\n"
-   # "🔊 <b>{audio}</b>\n"
-   # "💬 <b>{subtitle}</b>\n\n"
-#)
-
 CAPTION_TEMPLATE = os.environ.get(
     "CAPTION_TEMPLATE",
     "<b>{title}</b>\n\n"
     "🎬 <b>{video_line}</b> | ⏳ <b>{duration}</b>\n"
-    # " | ⏳ <b>{duration}</b>\n"
-    # "🔊 <b>{audio}</b>\n"
-    # "💬 <b>{subtitle}</b>\n\n"
+    "🔊 <b>{audio}</b>\n"
+#    "💬 <b>{subtitle}</b>\n\n"
 )
