@@ -611,9 +611,7 @@ async def _safe_edit(msg, text: str, parse_mode=None):
     try:
         await msg.edit_text(text, parse_mode=parse_mode)
         _last_edit[key] = now
-    except (MessageNotModified, MessageIdInvalid):
-        pass
-    except Exception:
+    except (MessageNotModified, Exception):
         pass
 
 
@@ -638,12 +636,10 @@ async def _process_channel_queue(channel_id: int):
                     await message.edit_caption(caption, parse_mode=ParseMode.HTML)
                     last_edit_time[channel_id] = asyncio.get_event_loop().time()
                     await save_last_id(channel_id, message.id)
-                except MessageIdInvalid:
-                    logger.warning(f"Retry edit skipped: Message deleted or invalid.")
                 except Exception as err:
                     logger.error(f"Retry edit failed: {err}")
             except MessageIdInvalid:
-                logger.warning(f"Edit skipped: Message deleted or invalid.")
+                logger.warning(f"Skipped edit: Message {message.id} in chat {channel_id} was deleted or inaccessible.")
             except Exception as e:
                 logger.error(f"Edit failed: {e}")
 
@@ -822,14 +818,12 @@ async def update_cmd(_, m):
 
 
 def _install_deps():
-    env = os.environ.copy()
-    env["DEBIAN_FRONTEND"] = "noninteractive"
     for binary, pkg in (("ffprobe", "ffmpeg"), ("mediainfo", "mediainfo")):
         r = subprocess.run(["which", binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if r.returncode != 0:
             logger.info(f"Installing {pkg}…")
-            subprocess.run(["apt-get", "update", "-y", "-q"], stdout=subprocess.DEVNULL, env=env)
-            subprocess.run(["apt-get", "install", "-y", "-q", pkg], stdout=subprocess.DEVNULL, env=env)
+            subprocess.run(["apt", "update", "-y"], stdout=subprocess.DEVNULL)
+            subprocess.run(["apt", "install", "-y", pkg], stdout=subprocess.DEVNULL)
 
 # --- KOYEB HEALTH CHECK FEATURE ---
 async def health_check(request):
