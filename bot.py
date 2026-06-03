@@ -9,6 +9,8 @@ import gc
 import re
 import uuid
 import time
+import collections
+import datetime
 from motor.motor_asyncio import AsyncIOMotorClient # Added for DB
 from aiohttp import web # Added for Health Check
 from aiofiles import open as aiopen
@@ -33,11 +35,24 @@ logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, force=True)
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
+# --- IN-MEMORY LOG BUFFER (for /logs command) ---
+_log_buffer: collections.deque = collections.deque(maxlen=200)
+
+class _BufferHandler(logging.Handler):
+    def emit(self, record):
+        _log_buffer.append(self.format(record))
+
+_buf_handler = _BufferHandler()
+_buf_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+logging.getLogger().addHandler(_buf_handler)
+
 # --- DATABASE SETUP ---
 db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client["MediaInfo-Bot"]
-last_id_collection = db["last_processed_id"]
-settings_collection = db["settings"] # For Dynamic Allowed Chats
+last_id_collection   = db["last_processed_id"]
+settings_collection  = db["settings"]          # For Dynamic Allowed Chats
+stats_collection     = db["stats"]             # Per-chat processed counts
+retry_collection     = db["retry_queue"]       # Failed edits pending retry
 
 # --- RATE LIMITER CONFIG ---
 # Rate limiter disabled as requested. We now rely strictly on EDIT_DELAY.
@@ -73,6 +88,88 @@ async def save_last_id(chat_id: int, last_id: int):
         {"$set": {"last_id": last_id}},
         upsert=True
     )
+
+# --- STATS HELPERS ---
+async def increment_stat(chat_id: int):
+    """Increment processed-file counter for a chat."""
+    await stats_collection.update_one(
+        {"chat_id": chat_id},
+        {"$inc": {"count": 1}},
+        upsert=True
+    )
+
+async def get_all_stats() -> list[dict]:
+    """Return all per-chat stats sorted by count descending."""
+    return await stats_collection.find({}).sort("count", -1).to_list(length=None)
+
+# --- ERROR COUNTER (for admin DM alerts) ---
+_error_counts: dict[int, int] = defaultdict(int)   # chat_id -> consecutive failures
+ERROR_THRESHOLD = 3                                  # DM admin after this many in a row
+
+async def _report_error(chat_id: int, reason: str):
+    """Track consecutive failures per chat; DM admin when threshold hit."""
+    _error_counts[chat_id] += 1
+    if _error_counts[chat_id] >= ERROR_THRESHOLD:
+        _error_counts[chat_id] = 0
+        try:
+            await app.send_message(
+                ADMIN_ID,
+                f"⚠️ <b>Error Alert</b>\n"
+                f"Chat: <code>{chat_id}</code>\n"
+                f"Failed <b>{ERROR_THRESHOLD}x</b> in a row.\n"
+                f"Reason: <code>{reason}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+def _reset_error_count(chat_id: int):
+    _error_counts[chat_id] = 0
+
+# --- RETRY QUEUE HELPERS ---
+async def enqueue_retry(chat_id: int, message_id: int, caption: str):
+    """Persist a failed caption edit for later retry."""
+    await retry_collection.update_one(
+        {"chat_id": chat_id, "message_id": message_id},
+        {"$set": {
+            "caption": caption,
+            "attempts": 0,
+            "next_retry": datetime.datetime.utcnow() + datetime.timedelta(seconds=60),
+        }},
+        upsert=True,
+    )
+
+async def process_retry_queue():
+    """Scheduled job: retry failed caption edits."""
+    now = datetime.datetime.utcnow()
+    cursor = retry_collection.find({"next_retry": {"$lte": now}, "attempts": {"$lt": 5}})
+    docs = await cursor.to_list(length=50)
+    for doc in docs:
+        chat_id    = doc["chat_id"]
+        message_id = doc["message_id"]
+        caption    = doc["caption"]
+        attempts   = doc.get("attempts", 0)
+        try:
+            await app.edit_message_caption(chat_id, message_id, caption, parse_mode=ParseMode.HTML)
+            await retry_collection.delete_one({"_id": doc["_id"]})
+            logger.info(f"Retry success: chat={chat_id} msg={message_id}")
+        except FloodWait as e:
+            await retry_collection.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"next_retry": datetime.datetime.utcnow() + datetime.timedelta(seconds=e.value + 5)},
+                 "$inc": {"attempts": 1}},
+            )
+        except Exception as e:
+            if attempts + 1 >= 5:
+                await retry_collection.delete_one({"_id": doc["_id"]})
+                logger.warning(f"Retry abandoned after 5 attempts: {e}")
+            else:
+                backoff = 60 * (2 ** attempts)
+                await retry_collection.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"next_retry": datetime.datetime.utcnow() + datetime.timedelta(seconds=backoff)},
+                     "$inc": {"attempts": 1}},
+                )
 
 app = Client(
     "MediaInfo-Bot",
@@ -482,6 +579,27 @@ def _build_caption(message, media, result: tuple) -> str:
     )
 
 
+def _build_caption_from_tg(message, media) -> str:
+    """Fallback caption built purely from Telegram metadata (no mediainfo/ffprobe)."""
+    # Resolution from Telegram video object
+    height     = getattr(media, 'height', None)
+    width      = getattr(media, 'width',  None)
+    quality    = get_standard_resolution(min(w for w in (width, height) if w) if width and height else (height or width or 0))
+    video_line = quality or 'Unknown'
+
+    # Duration from Telegram
+    tg_dur = getattr(media, 'duration', None)
+    duration_str = _fmt_duration(tg_dur) if tg_dur else 'Unknown'
+
+    return CAPTION_TEMPLATE.format(
+        title      = message.caption or getattr(media, 'file_name', None) or 'Video',
+        video_line = video_line,
+        duration   = duration_str,
+        audio      = 'Original Audio',
+        subtitle   = 'No Esubs',
+    )
+
+
 def caption_has_media_info(caption: str) -> bool:
     if not caption:
         return False
@@ -553,10 +671,11 @@ async def process_message(message, progress_msg=None) -> tuple[str, Optional[str
             if os.path.exists(tmp):
                 await aioremove(tmp)
 
+    # --- FALLBACK: use Telegram's own metadata ---
     if progress_msg:
-        await _update("⚠️ Metadata not found in fast scan.")
-
-    return message.caption or getattr(media, 'file_name', None) or 'Video', None
+        await _update("⚠️ Deep scan failed — using Telegram metadata.")
+    logger.warning(f"Falling back to Telegram metadata for msg {message.id}")
+    return _build_caption_from_tg(message, media), None
 
 
 async def _safe_edit(msg, text: str, parse_mode=None):
@@ -593,6 +712,8 @@ async def _process_channel_queue(channel_id: int):
                 last_edit_time[channel_id] = asyncio.get_event_loop().time()
                 # SAVE TO DB
                 await save_last_id(channel_id, message.id)
+                await increment_stat(channel_id)
+                _reset_error_count(channel_id)
             except FloodWait as e:
                 EDIT_DELAY = max(EDIT_DELAY, e.value / 10 + 1)
                 await asyncio.sleep(e.value)
@@ -600,14 +721,20 @@ async def _process_channel_queue(channel_id: int):
                     await message.edit_caption(caption, parse_mode=ParseMode.HTML)
                     last_edit_time[channel_id] = asyncio.get_event_loop().time()
                     await save_last_id(channel_id, message.id)
+                    await increment_stat(channel_id)
+                    _reset_error_count(channel_id)
                 except MessageIdInvalid:
                     logger.warning("Edit skipped: Message deleted or invalid.")
                 except Exception as err:
                     logger.error(f"Retry edit failed: {err}")
+                    await enqueue_retry(channel_id, message.id, caption)
+                    await _report_error(channel_id, str(err))
             except MessageIdInvalid:
                 logger.warning("Edit skipped: Message deleted or invalid.")
             except Exception as e:
                 logger.error(f"Edit failed: {e}")
+                await enqueue_retry(channel_id, message.id, caption)
+                await _report_error(channel_id, str(e))
 
             if file_path and os.path.exists(file_path):
                 await aioremove(file_path)
@@ -677,6 +804,29 @@ async def info_command(_, message):
         if os.path.exists(tmp):
             await aioremove(tmp)
 
+
+@app.on_message(filters.command("info") & ~filters.reply)
+async def info_command_forward(_, message):
+    """Handle /info on a forwarded video (no reply needed)."""
+    target = message
+    # If the command message itself has no media, check if it's forwarded
+    media = message.video or message.document
+    if not media:
+        return await message.reply_text("⚠️ Send a video/document with the /info command, or reply to one.")
+
+    tmp = f"info_fwd_{message.id}_{uuid.uuid4().hex[:6]}.bin"
+    try:
+        ok = await _stream_chunk(media, 8 * 1024 * 1024, tmp)
+        result = await _probe(tmp)
+        caption = _build_caption(message, media, result)
+        await message.reply_text(caption, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.reply_text(f"❌ Failed\n\n<code>{e}</code>", parse_mode=ParseMode.HTML)
+    finally:
+        if os.path.exists(tmp):
+            await aioremove(tmp)
+
+
 # --- NEW ADMIN COMMANDS ---
 
 @app.on_message(filters.command("add") & filters.user(ADMIN_ID))
@@ -719,6 +869,88 @@ async def remove_chat(_, message):
 async def list_chats(_, message):
     chat_list = "\n".join([f"<code>{cid}</code>" for cid in authorized_chats])
     await message.reply_text(f"<b>Allowed Chats:</b>\n{chat_list}", parse_mode=ParseMode.HTML)
+
+
+# --- /stats COMMAND ---
+@app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
+async def stats_cmd(_, message):
+    all_stats = await get_all_stats()
+    if not all_stats:
+        return await message.reply_text("📊 No files processed yet.")
+    total = sum(s.get("count", 0) for s in all_stats)
+    lines = [f"📊 <b>Files Processed</b>\n<b>Total: {total}</b>\n"]
+    for s in all_stats[:20]:  # cap at 20 chats
+        lines.append(f"• <code>{s['chat_id']}</code> → <b>{s['count']}</b>")
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# --- /broadcast COMMAND ---
+@app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
+async def broadcast_cmd(_, message):
+    if len(message.command) < 2:
+        return await message.reply_text("❌ Usage: `/broadcast Your message here`")
+    text = message.text.split(None, 1)[1]
+    sent = failed = 0
+    for chat_id in list(authorized_chats):
+        try:
+            await app.send_message(chat_id, text)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Broadcast failed for {chat_id}: {e}")
+            failed += 1
+        await asyncio.sleep(0.4)  # avoid flood
+    await message.reply_text(f"✅ Broadcast done.\nSent: <b>{sent}</b> | Failed: <b>{failed}</b>", parse_mode=ParseMode.HTML)
+
+
+# --- /queue COMMAND ---
+@app.on_message(filters.command("queue") & filters.user(ADMIN_ID))
+async def queue_cmd(_, message):
+    if not channel_queues:
+        return await message.reply_text("✅ All queues are empty.")
+    lines = ["📋 <b>Pending Queue</b>\n"]
+    total = 0
+    for cid, q in channel_queues.items():
+        if q:
+            lines.append(f"• <code>{cid}</code> → <b>{len(q)}</b> pending")
+            total += len(q)
+    if total == 0:
+        return await message.reply_text("✅ All queues are empty.")
+    lines.append(f"\n<b>Total pending: {total}</b>")
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# --- /setdelay COMMAND ---
+@app.on_message(filters.command("setdelay") & filters.user(ADMIN_ID))
+async def setdelay_cmd(_, message):
+    global EDIT_DELAY
+    try:
+        if len(message.command) < 2:
+            return await message.reply_text(f"⏱ Current delay: <b>{EDIT_DELAY}s</b>\nUsage: <code>/setdelay 5.0</code>", parse_mode=ParseMode.HTML)
+        val = float(message.command[1])
+        if val < 1.0 or val > 60.0:
+            return await message.reply_text("❌ Delay must be between 1.0 and 60.0 seconds.")
+        EDIT_DELAY = val
+        await message.reply_text(f"✅ Edit delay set to <b>{EDIT_DELAY}s</b>", parse_mode=ParseMode.HTML)
+    except ValueError:
+        await message.reply_text("❌ Invalid value. Use a number like `3.5`")
+
+
+# --- /logs COMMAND ---
+@app.on_message(filters.command("logs") & filters.user(ADMIN_ID))
+async def logs_cmd(_, message):
+    try:
+        n = int(message.command[1]) if len(message.command) > 1 else 20
+        n = max(1, min(n, 100))
+    except ValueError:
+        n = 20
+    lines = list(_log_buffer)[-n:]
+    if not lines:
+        return await message.reply_text("📭 No logs yet.")
+    log_text = "\n".join(lines)
+    # Telegram message limit is 4096 chars
+    if len(log_text) > 3800:
+        log_text = "…" + log_text[-3800:]
+    await message.reply_text(f"<pre>{log_text}</pre>", parse_mode=ParseMode.HTML)
 
 
 @app.on_message(filters.command("start") & filters.private)
@@ -815,11 +1047,12 @@ async def main():
     logger.info(f"@{me.username} started")
     
     try:
-        await app.send_message(ADMIN_ID, "🚀 Bot Started & Health Check Online")
+        await app.send_message(ADMIN_ID, "🚀 Bot Started & Health Check Online\n\nNew: /stats /broadcast /queue /setdelay /logs")
     except Exception:
         pass
 
-    scheduler.add_job(gc.collect, "interval", minutes=20)
+    scheduler.add_job(gc.collect,           "interval", minutes=20)
+    scheduler.add_job(process_retry_queue, "interval", minutes=2)
     scheduler.start()
 
     await asyncio.Event().wait()
