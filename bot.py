@@ -53,7 +53,6 @@ last_id_collection   = db["last_processed_id"]
 settings_collection  = db["settings"]          # For Dynamic Allowed Chats
 stats_collection     = db["stats"]             # Per-chat processed counts
 retry_collection     = db["retry_queue"]       # Failed edits pending retry
-task_queue_collection = db["task_queue"]       # Persistent queue surviving restarts
 
 # --- RATE LIMITER CONFIG ---
 # Rate limiter disabled as requested. We now rely strictly on EDIT_DELAY.
@@ -89,44 +88,6 @@ async def save_last_id(chat_id: int, last_id: int):
         {"$set": {"last_id": last_id}},
         upsert=True
     )
-
-# --- PERSISTENT TASK QUEUE HELPERS ---
-async def persist_task(chat_id: int, message_id: int):
-    """Save a pending task to MongoDB."""
-    await task_queue_collection.update_one(
-        {"chat_id": chat_id, "message_id": message_id},
-        {"$setOnInsert": {"chat_id": chat_id, "message_id": message_id, "queued_at": datetime.datetime.utcnow()}},
-        upsert=True,
-    )
-
-async def remove_task(chat_id: int, message_id: int):
-    """Remove a completed/failed task from MongoDB."""
-    await task_queue_collection.delete_one({"chat_id": chat_id, "message_id": message_id})
-
-async def restore_tasks():
-    """On startup: reload persisted tasks and re-queue them."""
-    docs = await task_queue_collection.find({}).sort("queued_at", 1).to_list(length=None)
-    if not docs:
-        return
-    logger.info(f"Restoring {len(docs)} queued tasks from DB…")
-    for doc in docs:
-        chat_id    = doc["chat_id"]
-        message_id = doc["message_id"]
-        try:
-            message = await app.get_messages(chat_id, message_id)
-            if not message or not (message.video or message.document):
-                await remove_task(chat_id, message_id)
-                continue
-            if caption_has_media_info(message.caption or ''):
-                await remove_task(chat_id, message_id)
-                continue
-            channel_queues[chat_id].append(message)
-            if not active_channel_tasks[chat_id]:
-                asyncio.create_task(_process_channel_queue(chat_id))
-            logger.info(f"Restored task: chat={chat_id} msg={message_id}")
-        except Exception as e:
-            logger.warning(f"Failed to restore task chat={chat_id} msg={message_id}: {e}")
-            await remove_task(chat_id, message_id)
 
 # --- STATS HELPERS ---
 async def increment_stat(chat_id: int):
@@ -227,7 +188,6 @@ _last_edit:      dict[int, float] = {}
 channel_queues:  dict[int, list]  = defaultdict(list)
 channel_locks:   dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 last_edit_time:  dict[int, float] = {}
-active_channel_tasks: dict[int, bool] = defaultdict(bool)  # True if worker running
 EDIT_DELAY = 3.5
 
 scheduler = AsyncIOScheduler()
@@ -782,9 +742,7 @@ async def _safe_edit(msg, text: str, parse_mode=None):
 
 async def _process_channel_queue(channel_id: int):
     global EDIT_DELAY
-    active_channel_tasks[channel_id] = True
-    try:
-      async with channel_locks[channel_id]:
+    async with channel_locks[channel_id]:
         while channel_queues[channel_id]:
             message = channel_queues[channel_id].pop(0)
             
@@ -804,7 +762,6 @@ async def _process_channel_queue(channel_id: int):
                 await save_last_id(channel_id, message.id)
                 await increment_stat(channel_id)
                 _reset_error_count(channel_id)
-                await remove_task(channel_id, message.id)
             except FloodWait as e:
                 EDIT_DELAY = max(EDIT_DELAY, e.value / 10 + 1)
                 await asyncio.sleep(e.value)
@@ -814,28 +771,21 @@ async def _process_channel_queue(channel_id: int):
                     await save_last_id(channel_id, message.id)
                     await increment_stat(channel_id)
                     _reset_error_count(channel_id)
-                    await remove_task(channel_id, message.id)
                 except MessageIdInvalid:
                     logger.warning("Edit skipped: Message deleted or invalid.")
-                    await remove_task(channel_id, message.id)
                 except Exception as err:
                     logger.error(f"Retry edit failed: {err}")
                     await enqueue_retry(channel_id, message.id, caption)
-                    await remove_task(channel_id, message.id)
                     await _report_error(channel_id, str(err))
             except MessageIdInvalid:
                 logger.warning("Edit skipped: Message deleted or invalid.")
-                await remove_task(channel_id, message.id)
             except Exception as e:
                 logger.error(f"Edit failed: {e}")
                 await enqueue_retry(channel_id, message.id, caption)
-                await remove_task(channel_id, message.id)
                 await _report_error(channel_id, str(e))
 
             if file_path and os.path.exists(file_path):
                 await aioremove(file_path)
-    finally:
-        active_channel_tasks[channel_id] = False
 
 
 @app.on_message(
@@ -848,11 +798,8 @@ async def channel_handler(_, message):
         return
 
     channel_id = message.chat.id
-    await persist_task(channel_id, message.id)
     channel_queues[channel_id].append(message)
-    # Only spawn a new worker if one isn't already running for this channel
-    if not active_channel_tasks[channel_id]:
-        asyncio.create_task(_process_channel_queue(channel_id))
+    asyncio.create_task(_process_channel_queue(channel_id))
 
 
 @app.on_message(filters.private & (filters.video | filters.document))
@@ -1146,10 +1093,7 @@ async def main():
     await app.start()
     me = await app.get_me()
     logger.info(f"@{me.username} started")
-
-    # Restore persisted queue tasks from previous session
-    await restore_tasks()
-
+    
     try:
         await app.send_message(ADMIN_ID, "🚀 Bot Started & Health Check Online\n\nNew: /stats /broadcast /queue /setdelay /logs")
     except Exception:
