@@ -29,5 +29,5 @@ CAPTION_TEMPLATE = os.environ.get(
     "<b>{title}</b>\n\n"
     "🎬 <b>{video_line}</b> | ⏳ <b>{duration}</b>\n"
     "🔊 <b>{audio}</b>\n"
-    "💬 <b>{subtitle}</b>\n\n"
+#    "💬 <b>{subtitle}</b>\n\n"
 )
