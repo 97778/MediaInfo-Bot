@@ -637,12 +637,55 @@ async def _stream_chunk(media, size: int, path: str) -> bool:
                     if written >= size:
                         break
         return os.path.exists(path) and os.path.getsize(path) > 0
+    except FloodWait as e:
+        logger.warning(f"stream_chunk FloodWait ({size}): waiting {e.value}s before continuing")
+        await asyncio.sleep(e.value + 2)
+        return False
+    except Exception as e:
+        logger.warning(f"stream_chunk failed ({size}): {e}")
+        return False
+
+
+# Global flag to track active flood wait so all queued chunks skip immediately
+_dc_flood_until: float = 0.0
+
+
+async def _stream_chunk_safe(media, size: int, path: str) -> bool:
+    """Wrapper that skips the call entirely if a DC flood wait is still active."""
+    global _dc_flood_until
+    now = asyncio.get_event_loop().time()
+    if now < _dc_flood_until:
+        remaining = int(_dc_flood_until - now)
+        logger.warning(f"stream_chunk skipped ({size}): DC flood wait active for {remaining}s more")
+        return False
+    try:
+        written = 0
+        async with stream_semaphore:
+            async with aiopen(path, 'wb') as f:
+                async for chunk in app.stream_media(media):
+                    if not chunk:
+                        break
+                    left = size - written
+                    if left <= 0:
+                        break
+                    piece = chunk[:left]
+                    await f.write(piece)
+                    written += len(piece)
+                    if written >= size:
+                        break
+        return os.path.exists(path) and os.path.getsize(path) > 0
+    except FloodWait as e:
+        _dc_flood_until = asyncio.get_event_loop().time() + e.value + 5
+        logger.warning(f"stream_chunk FloodWait ({size}): DC flood wait set for {e.value}s")
+        await asyncio.sleep(e.value + 2)
+        return False
     except Exception as e:
         logger.warning(f"stream_chunk failed ({size}): {e}")
         return False
 
 
 async def process_message(message, progress_msg=None) -> tuple[str, Optional[str]]:
+    global _dc_flood_until
     media = message.video or message.document
 
     async def _update(text: str):
@@ -653,10 +696,15 @@ async def process_message(message, progress_msg=None) -> tuple[str, Optional[str
     await _update("⚡ Fast scan (16 KB)…")
 
     for label, size in _STREAM_STEPS:
+        # If a DC flood wait is still active, skip all remaining probe steps immediately
+        if asyncio.get_event_loop().time() < _dc_flood_until:
+            logger.warning(f"Skipping all probe steps — DC flood wait active")
+            break
+
         tmp = f"probe_{label}_{message.id}_{uuid.uuid4().hex[:8]}.bin"
         try:
             await _update(f"📦 Scanning {label}…")
-            ok = await _stream_chunk(media, size, tmp)
+            ok = await _stream_chunk_safe(media, size, tmp)
             if not ok:
                 continue
 
