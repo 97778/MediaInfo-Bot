@@ -121,7 +121,8 @@ async def restore_tasks():
                 await remove_task(chat_id, message_id)
                 continue
             channel_queues[chat_id].append(message)
-            asyncio.create_task(_process_channel_queue(chat_id))
+            if not active_channel_tasks[chat_id]:
+                asyncio.create_task(_process_channel_queue(chat_id))
             logger.info(f"Restored task: chat={chat_id} msg={message_id}")
         except Exception as e:
             logger.warning(f"Failed to restore task chat={chat_id} msg={message_id}: {e}")
@@ -226,6 +227,7 @@ _last_edit:      dict[int, float] = {}
 channel_queues:  dict[int, list]  = defaultdict(list)
 channel_locks:   dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 last_edit_time:  dict[int, float] = {}
+active_channel_tasks: dict[int, bool] = defaultdict(bool)  # True if worker running
 EDIT_DELAY = 3.5
 
 scheduler = AsyncIOScheduler()
@@ -780,7 +782,9 @@ async def _safe_edit(msg, text: str, parse_mode=None):
 
 async def _process_channel_queue(channel_id: int):
     global EDIT_DELAY
-    async with channel_locks[channel_id]:
+    active_channel_tasks[channel_id] = True
+    try:
+      async with channel_locks[channel_id]:
         while channel_queues[channel_id]:
             message = channel_queues[channel_id].pop(0)
             
@@ -830,6 +834,8 @@ async def _process_channel_queue(channel_id: int):
 
             if file_path and os.path.exists(file_path):
                 await aioremove(file_path)
+    finally:
+        active_channel_tasks[channel_id] = False
 
 
 @app.on_message(
@@ -844,7 +850,9 @@ async def channel_handler(_, message):
     channel_id = message.chat.id
     await persist_task(channel_id, message.id)
     channel_queues[channel_id].append(message)
-    asyncio.create_task(_process_channel_queue(channel_id))
+    # Only spawn a new worker if one isn't already running for this channel
+    if not active_channel_tasks[channel_id]:
+        asyncio.create_task(_process_channel_queue(channel_id))
 
 
 @app.on_message(filters.private & (filters.video | filters.document))
