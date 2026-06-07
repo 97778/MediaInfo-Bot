@@ -1050,9 +1050,7 @@ async def restart_cmd(_, m):
 @app.on_message(filters.command("shutdown") & filters.user(ADMIN_ID))
 async def shutdown_cmd(_, m):
     await m.reply_text("Shutting down…")
-    scheduler.shutdown(wait=False)
-    await app.stop()
-    os._exit(0)
+    asyncio.get_event_loop().call_soon(os._exit, 0)
 
 
 @app.on_message(filters.command("update") & filters.user(ADMIN_ID))
