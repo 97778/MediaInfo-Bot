@@ -180,9 +180,8 @@ app = Client(
     sleep_threshold=60,
 )
 
-stream_semaphore  = asyncio.Semaphore(4)
-channel_semaphore = asyncio.Semaphore(3)
-global_processing_lock = asyncio.Lock()  # Added to ensure strict single-file global bottleneck
+stream_semaphore  = asyncio.Semaphore(1)
+channel_semaphore = asyncio.Semaphore(1)
 active_users: set = set()
 
 _last_edit:      dict[int, float] = {}
@@ -676,21 +675,12 @@ async def _stream_chunk_safe(media, size: int, path: str) -> bool:
                         break
         return os.path.exists(path) and os.path.getsize(path) > 0
     except FloodWait as e:
+        # Set the global flag — do NOT sleep here, just bail out immediately
         _dc_flood_until = asyncio.get_event_loop().time() + e.value + 5
-        logger.warning(f"stream_chunk FloodWait ({size}): DC flood wait set for {e.value}s")
-        await asyncio.sleep(e.value + 2)
+        logger.warning(f"stream_chunk FloodWait ({size}): DC blocked for {e.value}s — falling back to TG metadata")
         return False
     except Exception as e:
-        # Intercept internal auth flood waits that bypass Pyrogram's normal exception types
-        if "FLOOD_WAIT" in str(e):
-            try:
-                seconds = int(re.findall(r"\d+", str(e))[0])
-            except Exception:
-                seconds = 60
-            _dc_flood_until = asyncio.get_event_loop().time() + seconds + 10
-            logger.warning(f"Internal Pyrogram FloodWait intercepted. Global cooldown for {seconds}s active.")
-        else:
-            logger.warning(f"stream_chunk failed ({size}): {e}")
+        logger.warning(f"stream_chunk failed ({size}): {e}")
         return False
 
 
@@ -703,17 +693,12 @@ async def process_message(message, progress_msg=None) -> tuple[str, Optional[str
             await _safe_edit(progress_msg, text)
             await asyncio.sleep(0.3)
 
-    # Check cooldown state immediately before starting any probes
-    if asyncio.get_event_loop().time() < _dc_flood_until:
-        logger.warning(f"Skipping structural scanning for msg {message.id} due to active DC flood wait.")
-        return _build_caption_from_tg(message, media), None
-
     await _update("⚡ Fast scan (16 KB)…")
 
     for label, size in _STREAM_STEPS:
         # If a DC flood wait is still active, skip all remaining probe steps immediately
         if asyncio.get_event_loop().time() < _dc_flood_until:
-            logger.warning(f"Skipping all probe steps — DC flood wait active")
+            logger.warning(f"Skipping all probe steps — DC flood wait active for {int(_dc_flood_until - asyncio.get_event_loop().time())}s more")
             break
 
         tmp = f"probe_{label}_{message.id}_{uuid.uuid4().hex[:8]}.bin"
@@ -721,6 +706,9 @@ async def process_message(message, progress_msg=None) -> tuple[str, Optional[str
             await _update(f"📦 Scanning {label}…")
             ok = await _stream_chunk_safe(media, size, tmp)
             if not ok:
+                # If flood wait just got triggered, stop all remaining steps
+                if asyncio.get_event_loop().time() < _dc_flood_until:
+                    break
                 continue
 
             result = await _probe(tmp)
@@ -757,24 +745,15 @@ async def _safe_edit(msg, text: str, parse_mode=None):
 
 async def _process_channel_queue(channel_id: int):
     global EDIT_DELAY
-    async with channel_locks[channel_id]:
-        while channel_queues[channel_id]:
-            message = channel_queues[channel_id].pop(0)
-            
-            # Rate limit is now disabled, it just passes instantly
-            await check_rate_limit()
+    async with channel_semaphore:
+        async with channel_locks[channel_id]:
+            while channel_queues[channel_id]:
+                message = channel_queues[channel_id].pop(0)
 
-            # Acquire global lock to implement strict single-file processing globally
-            async with global_processing_lock:
+                # Rate limit is now disabled, it just passes instantly
+                await check_rate_limit()
+
                 caption, file_path = await process_message(message)
-
-                # Check if generated text matches old text to entirely prevent MESSAGE_NOT_MODIFIED
-                if message.caption == caption:
-                    logger.info(f"Skipping edit for msg {message.id}: Content is completely identical.")
-                    await save_last_id(channel_id, message.id)
-                    await increment_stat(channel_id)
-                    _reset_error_count(channel_id)
-                    continue
 
                 now  = asyncio.get_event_loop().time()
                 last = last_edit_time.get(channel_id, 0)
@@ -802,18 +781,17 @@ async def _process_channel_queue(channel_id: int):
                         logger.error(f"Retry edit failed: {err}")
                         await enqueue_retry(channel_id, message.id, caption)
                         await _report_error(channel_id, str(err))
-                except MessageNotModified:
-                    logger.info(f"Caught modified error safely on msg {message.id}")
-                    _reset_error_count(channel_id)
                 except MessageIdInvalid:
                     logger.warning("Edit skipped: Message deleted or invalid.")
+                except MessageNotModified:
+                    logger.warning("Edit skipped: Caption already up to date.")
                 except Exception as e:
                     logger.error(f"Edit failed: {e}")
                     await enqueue_retry(channel_id, message.id, caption)
                     await _report_error(channel_id, str(e))
 
-            if file_path and os.path.exists(file_path):
-                await aioremove(file_path)
+                if file_path and os.path.exists(file_path):
+                    await aioremove(file_path)
 
 
 @app.on_message(
@@ -847,9 +825,7 @@ async def _handle_private(message):
     try:
         await asyncio.sleep(0.5)
         progress_msg = await message.reply_text("⏳ Processing…")
-        # Enforce global lock line for incoming private workspace streams
-        async with global_processing_lock:
-            caption, file_path = await process_message(message, progress_msg)
+        caption, file_path = await process_message(message, progress_msg)
         try:
             await _safe_edit(progress_msg, caption, parse_mode=ParseMode.HTML)
         except MessageNotModified:
