@@ -180,7 +180,7 @@ app = Client(
     sleep_threshold=60,
 )
 
-stream_semaphore  = asyncio.Semaphore(2)
+stream_semaphore  = asyncio.Semaphore(4)
 channel_semaphore = asyncio.Semaphore(1)
 active_users: set = set()
 
