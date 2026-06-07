@@ -558,7 +558,9 @@ async def _probe(path: str) -> tuple:
     hdr       = mi[5]  or fp[5]
     transfer  = mi[6]  or fp[6]
     audio     = mi[7] if mi[7] != 'Unknown' else fp[7]
-    subtitle  = mi[8] if mi[8] != 'No Sub'  else fp[8]
+    
+    # FIX: Account for both 'No Sub' and 'No Esubs' internal default flags
+    subtitle  = mi[8] if mi[8] not in ('No Sub', 'No Esubs') else fp[8]
 
     return duration, width, height, codec, bit_depth, hdr, transfer, audio, subtitle
 
@@ -587,12 +589,35 @@ def _build_caption(message, media, result: tuple) -> str:
     )
 
 
+def _extract_res_from_text(text: str) -> Optional[str]:
+    """Helper regex to parse resolution tokens out of file names or captions."""
+    if not text:
+        return None
+    match = re.search(r'\b(240|360|480|720|1080|1440|2160)[pP]\b', text)
+    if match:
+        return f"{match.group(1)}p"
+    if "4k" in text.lower() or "2160p" in text.lower():
+        return "2160p"
+    return None
+
+
 def _build_caption_from_tg(message, media) -> str:
-    """Fallback caption built purely from Telegram metadata (no mediainfo/ffprobe)."""
-    # Resolution from Telegram video object
-    height     = getattr(media, 'height', None)
-    width      = getattr(media, 'width',  None)
-    quality    = get_standard_resolution(min(w for w in (width, height) if w) if width and height else (height or width or 0))
+    """Fallback caption built purely from Telegram metadata with smart filename parsing."""
+    title = message.caption or getattr(media, 'file_name', None) or 'Video'
+    
+    # 1. First, try extracting structural resolution tokens from the filename context
+    quality = _extract_res_from_text(title)
+    
+    # 2. If title context fails, fall back to Telegram API dimension wrappers
+    if not quality:
+        height = getattr(media, 'height', None)
+        width  = getattr(media, 'width',  None)
+        if width and height:
+            res_val = min(width, height)
+        else:
+            res_val = height or width or 0
+        quality = get_standard_resolution(res_val)
+        
     video_line = quality or 'Unknown'
 
     # Duration from Telegram
@@ -600,7 +625,7 @@ def _build_caption_from_tg(message, media) -> str:
     duration_str = _fmt_duration(tg_dur) if tg_dur else 'Unknown'
 
     return CAPTION_TEMPLATE.format(
-        title      = message.caption or getattr(media, 'file_name', None) or 'Video',
+        title      = title,
         video_line = video_line,
         duration   = duration_str,
         audio      = 'Original Audio',
