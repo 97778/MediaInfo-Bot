@@ -182,6 +182,7 @@ app = Client(
 
 stream_semaphore  = asyncio.Semaphore(4)
 channel_semaphore = asyncio.Semaphore(3)
+global_processing_lock = asyncio.Lock()  # Added to ensure strict single-file global bottleneck
 active_users: set = set()
 
 _last_edit:      dict[int, float] = {}
@@ -680,7 +681,16 @@ async def _stream_chunk_safe(media, size: int, path: str) -> bool:
         await asyncio.sleep(e.value + 2)
         return False
     except Exception as e:
-        logger.warning(f"stream_chunk failed ({size}): {e}")
+        # Intercept internal auth flood waits that bypass Pyrogram's normal exception types
+        if "FLOOD_WAIT" in str(e):
+            try:
+                seconds = int(re.findall(r"\d+", str(e))[0])
+            except Exception:
+                seconds = 60
+            _dc_flood_until = asyncio.get_event_loop().time() + seconds + 10
+            logger.warning(f"Internal Pyrogram FloodWait intercepted. Global cooldown for {seconds}s active.")
+        else:
+            logger.warning(f"stream_chunk failed ({size}): {e}")
         return False
 
 
@@ -692,6 +702,11 @@ async def process_message(message, progress_msg=None) -> tuple[str, Optional[str
         if progress_msg:
             await _safe_edit(progress_msg, text)
             await asyncio.sleep(0.3)
+
+    # Check cooldown state immediately before starting any probes
+    if asyncio.get_event_loop().time() < _dc_flood_until:
+        logger.warning(f"Skipping structural scanning for msg {message.id} due to active DC flood wait.")
+        return _build_caption_from_tg(message, media), None
 
     await _update("⚡ Fast scan (16 KB)…")
 
@@ -749,40 +764,53 @@ async def _process_channel_queue(channel_id: int):
             # Rate limit is now disabled, it just passes instantly
             await check_rate_limit()
 
-            caption, file_path = await process_message(message)
+            # Acquire global lock to implement strict single-file processing globally
+            async with global_processing_lock:
+                caption, file_path = await process_message(message)
 
-            now  = asyncio.get_event_loop().time()
-            last = last_edit_time.get(channel_id, 0)
-            if now - last < EDIT_DELAY:
-                await asyncio.sleep(EDIT_DELAY - (now - last))
-            try:
-                await message.edit_caption(caption, parse_mode=ParseMode.HTML)
-                last_edit_time[channel_id] = asyncio.get_event_loop().time()
-                # SAVE TO DB
-                await save_last_id(channel_id, message.id)
-                await increment_stat(channel_id)
-                _reset_error_count(channel_id)
-            except FloodWait as e:
-                EDIT_DELAY = max(EDIT_DELAY, e.value / 10 + 1)
-                await asyncio.sleep(e.value)
-                try:
-                    await message.edit_caption(caption, parse_mode=ParseMode.HTML)
-                    last_edit_time[channel_id] = asyncio.get_event_loop().time()
+                # Check if generated text matches old text to entirely prevent MESSAGE_NOT_MODIFIED
+                if message.caption == caption:
+                    logger.info(f"Skipping edit for msg {message.id}: Content is completely identical.")
                     await save_last_id(channel_id, message.id)
                     await increment_stat(channel_id)
                     _reset_error_count(channel_id)
+                    continue
+
+                now  = asyncio.get_event_loop().time()
+                last = last_edit_time.get(channel_id, 0)
+                if now - last < EDIT_DELAY:
+                    await asyncio.sleep(EDIT_DELAY - (now - last))
+                try:
+                    await message.edit_caption(caption, parse_mode=ParseMode.HTML)
+                    last_edit_time[channel_id] = asyncio.get_event_loop().time()
+                    # SAVE TO DB
+                    await save_last_id(channel_id, message.id)
+                    await increment_stat(channel_id)
+                    _reset_error_count(channel_id)
+                except FloodWait as e:
+                    EDIT_DELAY = max(EDIT_DELAY, e.value / 10 + 1)
+                    await asyncio.sleep(e.value)
+                    try:
+                        await message.edit_caption(caption, parse_mode=ParseMode.HTML)
+                        last_edit_time[channel_id] = asyncio.get_event_loop().time()
+                        await save_last_id(channel_id, message.id)
+                        await increment_stat(channel_id)
+                        _reset_error_count(channel_id)
+                    except MessageIdInvalid:
+                        logger.warning("Edit skipped: Message deleted or invalid.")
+                    except Exception as err:
+                        logger.error(f"Retry edit failed: {err}")
+                        await enqueue_retry(channel_id, message.id, caption)
+                        await _report_error(channel_id, str(err))
+                except MessageNotModified:
+                    logger.info(f"Caught modified error safely on msg {message.id}")
+                    _reset_error_count(channel_id)
                 except MessageIdInvalid:
                     logger.warning("Edit skipped: Message deleted or invalid.")
-                except Exception as err:
-                    logger.error(f"Retry edit failed: {err}")
+                except Exception as e:
+                    logger.error(f"Edit failed: {e}")
                     await enqueue_retry(channel_id, message.id, caption)
-                    await _report_error(channel_id, str(err))
-            except MessageIdInvalid:
-                logger.warning("Edit skipped: Message deleted or invalid.")
-            except Exception as e:
-                logger.error(f"Edit failed: {e}")
-                await enqueue_retry(channel_id, message.id, caption)
-                await _report_error(channel_id, str(e))
+                    await _report_error(channel_id, str(e))
 
             if file_path and os.path.exists(file_path):
                 await aioremove(file_path)
@@ -819,7 +847,9 @@ async def _handle_private(message):
     try:
         await asyncio.sleep(0.5)
         progress_msg = await message.reply_text("⏳ Processing…")
-        caption, file_path = await process_message(message, progress_msg)
+        # Enforce global lock line for incoming private workspace streams
+        async with global_processing_lock:
+            caption, file_path = await process_message(message, progress_msg)
         try:
             await _safe_edit(progress_msg, caption, parse_mode=ParseMode.HTML)
         except MessageNotModified:
