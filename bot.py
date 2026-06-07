@@ -1132,7 +1132,7 @@ async def main():
     logger.info(f"@{me.username} started")
     
     try:
-        await app.send_message(ADMIN_ID, "🚀 Bot Started & Health Check Online\n\nNew: /stats /broadcast /queue /setdelay /logs")
+        await app.send_message(ADMIN_ID, "🚀 Bot Started & Health Check Online\n\nNew: /stats /queue /setdelay /logs /update")
     except Exception:
         pass
 
