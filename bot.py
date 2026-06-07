@@ -579,7 +579,7 @@ def _build_caption(message, media, result: tuple) -> str:
     video_line  = ' '.join(filter(None, [quality, fmt])) or 'Unknown'
 
     return CAPTION_TEMPLATE.format(
-        title     = message.caption or getattr(media, 'file_name', None) or 'Video',
+        title     = (message.caption or getattr(media, 'file_name', None) or 'Video').strip(),
         video_line= video_line,
         duration  = _fmt_duration(duration) if duration else 'Unknown',
         audio     = audio,
@@ -600,7 +600,7 @@ def _build_caption_from_tg(message, media) -> str:
     duration_str = _fmt_duration(tg_dur) if tg_dur else 'Unknown'
 
     return CAPTION_TEMPLATE.format(
-        title      = message.caption or getattr(media, 'file_name', None) or 'Video',
+        title      = (message.caption or getattr(media, 'file_name', None) or 'Video').strip(),
         video_line = video_line,
         duration   = duration_str,
         audio      = 'Original Audio',
