@@ -180,7 +180,7 @@ app = Client(
     sleep_threshold=60,
 )
 
-stream_semaphore  = asyncio.Semaphore(1)
+stream_semaphore  = asyncio.Semaphore(2)
 channel_semaphore = asyncio.Semaphore(1)
 active_users: set = set()
 
@@ -488,15 +488,15 @@ def _parse_tracks(tracks: list) -> tuple:
                 duration = _parse_duration(track.get('Duration'))
 
         elif _is_video_track(track):
-            for field in ('Height', 'Sampled_Height', 'Encoded_Height'):
-                raw = str(track.get(field, '') or '').split()[0]
-                if raw.isdigit():
+            for field in ('Height', 'Encoded_Height', 'Sampled_Height'):
+                raw = str(track.get(field, '') or '').replace('\u00a0', '').replace(',', '').split()[0]
+                if raw.isdigit() and int(raw) > 0:
                     height = int(raw)
                     break
 
-            for field in ('Width', 'Sampled_Width', 'Encoded_Width'):
-                raw = str(track.get(field, '') or '').split()[0]
-                if raw.isdigit():
+            for field in ('Width', 'Encoded_Width', 'Sampled_Width'):
+                raw = str(track.get(field, '') or '').replace('\u00a0', '').replace(',', '').split()[0]
+                if raw.isdigit() and int(raw) > 0:
                     width = int(raw)
                     break
 
@@ -566,7 +566,15 @@ async def _probe(path: str) -> tuple:
 def _build_caption(message, media, result: tuple) -> str:
     duration, width, height, codec, bit_depth, hdr, transfer, audio, sub = result
 
-    quality     = get_standard_resolution(min(w for w in (width, height) if w) if width and height else (height or width or 0))
+    # Always use height for resolution (standard convention: 1920x1080 = 1080p)
+    # Fall back to min(w,h) only if height is missing (portrait/unknown orientation)
+    if height:
+        res_val = height
+    elif width and height:
+        res_val = min(width, height)
+    else:
+        res_val = width or 0
+    quality     = get_standard_resolution(res_val)
     fmt         = get_video_format(codec, transfer, hdr, bit_depth)
     video_line  = ' '.join(filter(None, [quality, fmt])) or 'Unknown'
 
